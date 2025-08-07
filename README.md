@@ -55,20 +55,6 @@ build/app/outputs/flutter-apk/app-release.apk
 flutter build ios
 ```
 
----
-
-## 🗂️ Struktur Folder (Opsional)
-```
-lib/
-├── main.dart
-├── screens/
-├── widgets/
-├── models/
-├── services/
-```
-
----
-
 ## ✍️ Author
 - [Gerin_Sena_Pratama](https://github.com/username)
 
