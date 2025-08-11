@@ -1,8 +1,11 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
 import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
+import 'package:image/image.dart' as img;
 
 List<CameraDescription>? cameras;
 
@@ -31,84 +34,137 @@ class PoseClassifierPage extends StatefulWidget {
 
 class _PoseClassifierPageState extends State<PoseClassifierPage> {
   CameraController? _controller;
-  Timer? _timer;
-  int _selectedCameraIdx = 0;
   bool _isProcessing = false;
-
   String _hasilPrediksi = "-";
   double _confidence = 0.0;
-  int _frameCount = 0; // ✅ Tambahkan counter frame
+  int _frameCount = 0;
 
   @override
   void initState() {
     super.initState();
-    _initializeCamera(_selectedCameraIdx);
+    _initializeCamera();
   }
 
-  Future<void> _initializeCamera(int cameraIndex) async {
+  Future<void> _initializeCamera() async {
+    final camera = cameras!.first;
     _controller = CameraController(
-      cameras![cameraIndex],
-      ResolutionPreset.medium,
-      enableAudio: false,
+      camera,
+      ResolutionPreset.low,
+      imageFormatGroup: ImageFormatGroup.yuv420,
     );
 
     try {
       await _controller!.initialize();
-      if (mounted) setState(() {});
-      _startPeriodicCapture();
+      await _controller!.setFlashMode(FlashMode.off);
+
+      _controller!.startImageStream((CameraImage image) {
+        if (!_isProcessing) {
+          _isProcessing = true;
+          _processCameraImage(image).then((_) {
+            _isProcessing = false;
+          });
+        }
+      });
+
+      setState(() {});
     } catch (e) {
       print("Error initializing camera: $e");
     }
   }
 
-  void _startPeriodicCapture() {
-    _timer?.cancel();
-    _timer = Timer.periodic(Duration(milliseconds: 100), (_) async {
-      if (!_controller!.value.isInitialized || _isProcessing) return;
-      await _captureAndSend();
-    });
-  }
-
-  Future<void> _captureAndSend() async {
-    _isProcessing = true;
-
+  Future<void> _processCameraImage(CameraImage image) async {
     try {
-      final XFile file = await _controller!.takePicture();
-      final bytes = await file.readAsBytes();
+      // skip sebagian frame untuk membatasi FPS
+//       if (_frameCount > 0 && _frameCount % 5 != 0) {
+//         _frameCount++;
+//         return;
+//       }
 
-      final response = await http.post(
-        Uri.parse("http://192.168.1.5:8000/predict"),
-        headers: {'Content-Type': 'application/json'},
-        body: json.encode({'image': base64Encode(bytes)}),
-      ).timeout(Duration(seconds: 3));
+      final jpegBytes = await compute(_convertYUV420ToJpeg, image);
+      _frameCount++;
 
-      if (response.statusCode == 200) {
+      final base64Image = base64Encode(jpegBytes);
+
+      final response = await http
+          .post(
+            Uri.parse('http://192.168.55.114:8000/predict'),
+            headers: {'Content-Type': 'application/json'},
+            body: json.encode({'image': base64Image}),
+          )
+          .timeout(Duration(seconds: 2));
+
+      if (response.statusCode == 200 && mounted) {
         final result = json.decode(response.body);
-        if (mounted) {
-          setState(() {
-            _frameCount++; // ✅ Tambahkan setiap berhasil kirim frame
-            _hasilPrediksi = result['label'] ?? "-";
-            _confidence = (result['confidence'] ?? 0.0).toDouble();
-          });
-        }
+        setState(() {
+          _hasilPrediksi = result['label'] ?? "-";
+          _confidence = (result['confidence'] ?? 0.0).toDouble();
+        });
       } else {
-        print("HTTP Error: ${response.statusCode}");
+        print('HTTP Error: ${response.statusCode}');
       }
     } catch (e) {
-      print("Error: $e");
+      print('Error processing image: $e');
     }
-
-    _isProcessing = false;
   }
 
-  void _gantiKamera() async {
-    _selectedCameraIdx = (_selectedCameraIdx + 1) % cameras!.length;
-    await _initializeCamera(_selectedCameraIdx);
+  static Uint8List _convertYUV420ToJpeg(CameraImage image) {
+    final width = image.width;
+    final height = image.height;
+
+    final rgbBytes = _yuv420ToRgb(image);
+    final img.Image baseImage = img.Image.fromBytes(
+      width: width,
+      height: height,
+      bytes: rgbBytes.buffer,   // ByteBuffer sesuai API terbaru
+      numChannels: 3,
+    );
+
+    return Uint8List.fromList(img.encodeJpg(baseImage, quality: 80));
+  }
+
+  static Uint8List _yuv420ToRgb(CameraImage image) {
+    final int width = image.width;
+    final int height = image.height;
+    final yRowStride = image.planes[0].bytesPerRow;
+    final uvRowStride = image.planes[1].bytesPerRow;
+    final uvPixelStride = image.planes[1].bytesPerPixel!;
+
+    final yBuffer = image.planes[0].bytes;
+    final uBuffer = image.planes[1].bytes;
+    final vBuffer = image.planes[2].bytes;
+
+    final rgbBuffer = Uint8List(width * height * 3);
+    int index = 0;
+
+    for (int y = 0; y < height; y++) {
+      for (int x = 0; x < width; x++) {
+        final yp = y * yRowStride + x;
+        final uvIndex = uvPixelStride * (x >> 1) + uvRowStride * (y >> 1);
+
+        final yValue = yBuffer[yp];
+        final uValue = uBuffer[uvIndex];
+        final vValue = vBuffer[uvIndex];
+
+        final r =
+            (yValue + 1.370705 * (vValue - 128)).clamp(0, 255).toInt();
+        final g = (yValue -
+                0.337633 * (uValue - 128) -
+                0.698001 * (vValue - 128))
+            .clamp(0, 255)
+            .toInt();
+        final b =
+            (yValue + 1.732446 * (uValue - 128)).clamp(0, 255).toInt();
+
+        rgbBuffer[index++] = r;
+        rgbBuffer[index++] = g;
+        rgbBuffer[index++] = b;
+      }
+    }
+    return rgbBuffer;
   }
 
   @override
   void dispose() {
-    _timer?.cancel();
     _controller?.dispose();
     super.dispose();
   }
@@ -120,37 +176,24 @@ class _PoseClassifierPageState extends State<PoseClassifierPage> {
       body: Column(
         children: [
           if (_controller != null && _controller!.value.isInitialized)
-            Expanded(
-              child: FittedBox(
-                fit: BoxFit.cover,
-                child: SizedBox(
-                  width: _controller!.value.previewSize!.height,
-                  height: _controller!.value.previewSize!.width,
-                  child: CameraPreview(_controller!),
-                ),
-              ),
-            ),
-          Container(
-            padding: EdgeInsets.symmetric(vertical: 20),
+            Expanded(child: CameraPreview(_controller!)),
+          Padding(
+            padding: const EdgeInsets.all(16),
             child: Column(
               children: [
                 Text(
                   "Hasil: $_hasilPrediksi",
-                  style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
+                  style: TextStyle(
+                      fontSize: 22, fontWeight: FontWeight.bold),
                 ),
                 Text(
                   "Confidence: ${(_confidence * 100).toStringAsFixed(2)}%",
                   style: TextStyle(fontSize: 16),
                 ),
                 Text(
-                  "Total Frame Dikirim: $_frameCount", // ✅ Tampilkan frame count
-                  style: TextStyle(fontSize: 16, color: Colors.grey[700]),
-                ),
-                SizedBox(height: 10),
-                ElevatedButton.icon(
-                  onPressed: _gantiKamera,
-                  icon: Icon(Icons.cameraswitch),
-                  label: Text("Ganti Kamera"),
+                  "Total Frame Dikirim: $_frameCount",
+                  style: TextStyle(
+                      fontSize: 16, color: Colors.grey[700]),
                 ),
               ],
             ),
